@@ -234,7 +234,7 @@ func (p *Prover) Start() error {
 		return err
 	}
 	p.L1BlockHeightOnStartup = stateVars.NumBlocks
-	p.targetBlockId = p.L1BlockHeightOnStartup - 10
+	p.targetBlockId = p.L1BlockHeightOnStartup
 	go p.eventLoop()
 
 	return nil
@@ -296,13 +296,13 @@ func (p *Prover) eventLoop() {
 			}()
 		case proofWithHeader := <-p.proofGenerationCh:
 			p.submitProofOp(p.ctx, proofWithHeader)
-			currentTargetHeight = currentTargetHeight - 1
+			currentTargetHeight = currentTargetHeight + 1
 		case <-p.proveNotify:
 //			log.Info("Try proving new blocks:", "BlockID", currentTargetHeight)
 			if err := p.proveOp(p.ctx, new(big.Int).SetUint64(currentTargetHeight)); err != nil {
 				log.Error("Prove new blocks error", "error", err)
+				currentTargetHeight = currentTargetHeight - 1
 			}
-			currentTargetHeight = currentTargetHeight - 1
 		case <-p.blockProposedCh:
 			reqProving()
 		case e := <-p.blockVerifiedCh:
@@ -323,7 +323,7 @@ func (p *Prover) eventLoop() {
 			if err := p.onBlockProven(p.ctx, e); err != nil {
 				log.Error("Handle BlockProven event error", "error", err)
 			}
-			currentTargetHeight = currentTargetHeight - 1
+			currentTargetHeight = currentTargetHeight + 1
 		case e := <-p.proverSlashedCh:
 			if e.Addr.Hex() == p.proverAddress.Hex() {
 				log.Info("Prover slashed", "address", e.Addr.Hex(), "amount", e.Amount)
@@ -332,7 +332,7 @@ func (p *Prover) eventLoop() {
 			}
 		case <-forceProvingTicker.C:
 			reqProving()
-			currentTargetHeight = currentTargetHeight - 1
+			currentTargetHeight = currentTargetHeight + 1
 		}
 	}
 }
@@ -401,7 +401,7 @@ func (p *Prover) proveOp(ctx context.Context, blockId *big.Int) error {
 	// If this block is already proven, we will pass this block
 	if isProven {
 		log.Info("Pass proven block", "blockID", blockId)
-		p.targetBlockId = blockId.Uint64() - 1
+		p.targetBlockId = blockId.Uint64() + 1
 		return nil
 	}
 
@@ -414,8 +414,24 @@ func (p *Prover) proveOp(ctx context.Context, blockId *big.Int) error {
 	// If this block is already assigned, we will put this block into waiting list to be proven later(after expired)
 	if (block.AssignedProver != p.proverAddress && block.AssignedProver != zeroAddress /*&& !proofWindowExpired*/) {
 		log.Info("Pass unproveable block", "blockID", blockId)
-		p.targetBlockId = blockId.Uint64() - 1
+		p.targetBlockId = blockId.Uint64() + 1
         return nil
+	}
+
+	// Judge the gasUsed amount on the block
+	l2Block, l2err := p.rpc.L2.BlockByNumber(ctx, blockId)
+	if l2err != nil {
+		return l2err
+	}
+
+	gasUsed := l2Block.GasUsed()
+	gasLimit := l2Block.GasLimit()
+	// calculate gasUsed ratio from l2Block.GasUsed and l2Block.GasLimit
+	// if gasUsed ratio is less than 0.9, we will pass this block
+	if float64(gasUsed) / float64(gasLimit) < float64(0.9) {
+		log.Info("Pass block", "blockID", blockId, "gasRatio", float64(gasUsed) / float64(gasLimit))
+		p.targetBlockId = blockId.Uint64() + 1
+		return nil
 	}
 
 
@@ -556,7 +572,7 @@ func (p *Prover) onBlockProposed(
 
 		if isVerified {
 			log.Info("📋 Block has been verified", "blockID", event.BlockId)
-			p.targetBlockId = event.BlockId.Uint64() - 1
+			p.targetBlockId = event.BlockId.Uint64() + 1
 			return nil
 		}
 
