@@ -1,6 +1,7 @@
 package flags
 
 import (
+	"time"
 	"github.com/urfave/cli/v2"
 )
 
@@ -104,6 +105,18 @@ var (
 		Usage:    "Gas limit will be used for TaikoL1.proveBlock transactions",
 		Category: proverCategory,
 	}
+	ProofSubmissionDelay = &cli.DurationFlag{
+		Name:     "prover.proofSubmissionDelay",
+		Usage:    "Delay(seconds) on block proof TX submission",
+		Category: proverCategory,
+		Value:    time.Second * 0,
+	}
+	ProofStartTimeBeforeExpiry = &cli.DurationFlag{
+		Name:     "prover.proofStartTimeBeforeExpiry",
+		Usage:    "Time(seconds) before proof window expiry to start proving",
+		Category: proverCategory,
+		Value:    time.Second * 0,
+	}
 )
 
 // All prover flags.
@@ -127,4 +140,6 @@ var ProverFlags = MergeFlags(CommonFlags, []cli.Flag{
 	CheckProofWindowExpiredInterval,
 	ProveUnassignedBlocks,
 	ProveBlockTxGasLimit,
+	ProofSubmissionDelay,
+	ProofStartTimeBeforeExpiry,
 })

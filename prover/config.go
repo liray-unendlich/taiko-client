@@ -42,6 +42,8 @@ type Config struct {
 	RPCTimeout                      *time.Duration
 	WaitReceiptTimeout              time.Duration
 	ProveBlockGasLimit              *uint64
+	ProofSubmissionDelay 			time.Duration
+	ProofStartTimeBeforeExpiry 		time.Duration
 }
 
 // NewConfigFromCliContext creates a new config instance from command line flags.
@@ -146,5 +148,7 @@ func NewConfigFromCliContext(c *cli.Context) (*Config, error) {
 		RPCTimeout:            timeout,
 		WaitReceiptTimeout:    time.Duration(c.Uint64(flags.WaitReceiptTimeout.Name)) * time.Second,
 		ProveBlockGasLimit:    proveBlockTxGasLimit,
+		ProofSubmissionDelay:  			time.Duration(c.Uint64(flags.ProofSubmissionDelay.Name)) * time.Second,
+		ProofStartTimeBeforeExpiry: 	time.Duration(c.Uint64(flags.ProofStartTimeBeforeExpiry.Name)) * time.Second,
 	}, nil
 }

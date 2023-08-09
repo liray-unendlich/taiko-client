@@ -51,6 +51,8 @@ type Prover struct {
 	// States
 	latestVerifiedL1Height uint64
 	lastHandledBlockID     uint64
+	L1BlockHeightOnStartup uint64
+	targetBlockId	       uint64
 	genesisHeightL1        uint64
 	l1Current              *types.Header
 	reorgDetectedFlag      bool
@@ -227,6 +229,12 @@ func InitFromConfig(ctx context.Context, p *Prover, cfg *Config) (err error) {
 func (p *Prover) Start() error {
 	p.wg.Add(1)
 	p.initSubscription()
+	stateVars, err := p.rpc.GetProtocolStateVariables(nil)
+	if err != nil {
+		return err
+	}
+	p.L1BlockHeightOnStartup = stateVars.NumBlocks
+	p.targetBlockId = p.L1BlockHeightOnStartup - 10
 	go p.eventLoop()
 
 	return nil
@@ -248,6 +256,7 @@ func (p *Prover) eventLoop() {
 	}
 
 	lastLatestVerifiedL1Height := p.latestVerifiedL1Height
+	currentTargetHeight := p.targetBlockId
 
 	// If there is too many (TaikoData.Config.maxNumBlocks) pending blocks in TaikoL1 contract, there will be no new
 	// BlockProposed temporarily, so except the BlockProposed subscription, we need another trigger to start
@@ -266,7 +275,7 @@ func (p *Prover) eventLoop() {
 
 	// Call reqProving() right away to catch up with the latest state.
 	reqProving()
-
+	loopCounter := 0
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -287,20 +296,34 @@ func (p *Prover) eventLoop() {
 			}()
 		case proofWithHeader := <-p.proofGenerationCh:
 			p.submitProofOp(p.ctx, proofWithHeader)
+			currentTargetHeight = currentTargetHeight - 1
 		case <-p.proveNotify:
-			if err := p.proveOp(); err != nil {
+//			log.Info("Try proving new blocks:", "BlockID", currentTargetHeight)
+			if err := p.proveOp(p.ctx, new(big.Int).SetUint64(currentTargetHeight)); err != nil {
 				log.Error("Prove new blocks error", "error", err)
 			}
+			currentTargetHeight = currentTargetHeight - 1
 		case <-p.blockProposedCh:
 			reqProving()
 		case e := <-p.blockVerifiedCh:
 			if err := p.onBlockVerified(p.ctx, e); err != nil {
 				log.Error("Handle BlockVerified event error", "error", err)
 			}
+			loopCounter++
+
+			if loopCounter % 1500 == 0 {
+				stateVars, err := p.rpc.GetProtocolStateVariables(nil)
+				if err != nil {
+					log.Error("Pull new Protocol state error", "error", err)
+				}
+				p.targetBlockId = stateVars.NumBlocks
+				currentTargetHeight = p.targetBlockId
+			}
 		case e := <-p.blockProvenCh:
 			if err := p.onBlockProven(p.ctx, e); err != nil {
 				log.Error("Handle BlockProven event error", "error", err)
 			}
+			currentTargetHeight = currentTargetHeight - 1
 		case e := <-p.proverSlashedCh:
 			if e.Addr.Hex() == p.proverAddress.Hex() {
 				log.Info("Prover slashed", "address", e.Addr.Hex(), "amount", e.Amount)
@@ -309,9 +332,53 @@ func (p *Prover) eventLoop() {
 			}
 		case <-forceProvingTicker.C:
 			reqProving()
+			currentTargetHeight = currentTargetHeight - 1
 		}
 	}
 }
+
+/*
+func (p *Prover) proveUnprovenBlock(currentBlockHeight uint64) {
+	p.unprovenBlocksMutex.Lock()
+    defer p.unprovenBlocksMutex.Unlock()
+
+    if len(p.unprovenBlocks) <= 11 {
+        // 証明すべきブロックが11以下の場合は何もしない
+        return
+    }
+
+    // リストの最後から10番目のブロックIDを取得
+    blockId := p.unprovenBlocks[len(p.unprovenBlocks)-10]
+
+    // ブロックが証明済みかどうかを確認
+    isVerified, err := p.isBlockVerified(new(big.Int).SetUint64(*blockId))
+    if err != nil {
+        log.Error("Failed to check if block is verified", "blockId", blockId, "error", err)
+        return
+    }
+
+    if isVerified {
+		// ブロックが証明済みなら、リストから削除して終了
+		for i, id := range p.unprovenBlocks {
+			if new(big.Int).SetUint64(*id).Cmp(new(big.Int).SetUint64(*blockId)) == 0 {
+				p.unprovenBlocks = append(p.unprovenBlocks[:i], p.unprovenBlocks[i+1:]...)
+				break
+			}
+		}
+        return
+    }
+
+    // ブロックが証明済みでない場合、証明を開始
+    p.requestProofForBlockId(new(big.Int).SetUint64(*blockId), new(big.Int).SetUint64(currentBlockHeight)) // 第二引数はlatestBlockHeightを入れる
+    // 証明を開始したブロックはリストから削除
+	for i, id := range p.unprovenBlocks {
+		if new(big.Int).SetUint64(*id).Cmp(new(big.Int).SetUint64(*blockId)) == 0 {
+			p.unprovenBlocks = append(p.unprovenBlocks[:i], p.unprovenBlocks[i+1:]...)
+			break
+		}
+	}
+}
+*/
 
 // Close closes the prover instance.
 func (p *Prover) Close() {
@@ -321,29 +388,69 @@ func (p *Prover) Close() {
 
 // proveOp performs a proving operation, find current unproven blocks, then
 // request generating proofs for them.
-func (p *Prover) proveOp() error {
-	firstTry := true
+	// proveOp tries to prove a specific block.
+func (p *Prover) proveOp(ctx context.Context, blockId *big.Int) error {
+    // If we are already proving, return directly
+    // Check whether the block has been proven.
+	//log.Info("Start verification check")
+    isProven, err := p.isBlockVerified(blockId)
+    if err != nil {
+        return fmt.Errorf("failed to check if the current L2 block is proven: %w", err)
+    }
 
-	for firstTry || p.reorgDetectedFlag {
-		p.reorgDetectedFlag = false
-		firstTry = false
-
-		iter, err := eventIterator.NewBlockProposedIterator(p.ctx, &eventIterator.BlockProposedIteratorConfig{
-			Client:               p.rpc.L1,
-			TaikoL1:              p.rpc.TaikoL1,
-			StartHeight:          new(big.Int).SetUint64(p.l1Current.Number.Uint64()),
-			OnBlockProposedEvent: p.onBlockProposed,
-		})
-		if err != nil {
-			return err
-		}
-
-		if err := iter.Iter(); err != nil {
-			return err
-		}
+	// If this block is already proven, we will pass this block
+	if isProven {
+		log.Info("Pass proven block", "blockID", blockId)
+		p.targetBlockId = blockId.Uint64() - 1
+		return nil
 	}
 
-	return nil
+	// Check whether the block has been assigned to other prover.
+	block, err := p.rpc.TaikoL1.GetBlock(nil, blockId)
+	if err != nil {
+		return err
+	}
+
+	// If this block is already assigned, we will put this block into waiting list to be proven later(after expired)
+	if (block.AssignedProver != p.proverAddress && block.AssignedProver != zeroAddress /*&& !proofWindowExpired*/) {
+		log.Info("Pass unproveable block", "blockID", blockId)
+		p.targetBlockId = blockId.Uint64() - 1
+        return nil
+	}
+
+
+
+		/*
+		// if we cant prove it now, but config is set to wait and try to prove
+		// expired proofs
+		if p.cfg.ProveUnassignedBlocks {
+			log.Info("Adding proposed block to wait for proof window expiration",
+				"blockID",
+				event.BlockId,
+				"prover",
+				block.AssignedProver.Hex(),
+				"proofWindowExpiresAt",
+				proofWindowExpiresAt,
+			)
+
+			p.currentBlocksWaitingForProofWindowMutex.Lock()
+			p.currentBlocksWaitingForProofWindow[event.Meta.Id] = event.Raw.BlockNumber
+			p.currentBlocksWaitingForProofWindowMutex.Unlock()
+		} */
+
+	l1Origin, err := p.rpc.L2.L1OriginByID(ctx, blockId)
+	if err != nil {
+		return err
+	}
+	l1OriginBlockId := l1Origin.L1BlockHeight
+
+    // Start the proof generation for the given blockId
+	//log.Info("Start proof generation for block", "blockID", blockId, "L1OriginBlockID", l1OriginBlockId)
+    if err := p.requestProofForBlockId(blockId, l1OriginBlockId); err != nil {
+        return fmt.Errorf("failed to request proof for block: %w", err)
+    }
+
+    return nil
 }
 
 // onBlockProposed tries to prove that the newly proposed block is valid/invalid.
@@ -449,6 +556,7 @@ func (p *Prover) onBlockProposed(
 
 		if isVerified {
 			log.Info("📋 Block has been verified", "blockID", event.BlockId)
+			p.targetBlockId = event.BlockId.Uint64() - 1
 			return nil
 		}
 
@@ -601,7 +709,7 @@ func (p *Prover) onBlockProposed(
 		})
 		p.currentBlocksBeingProvenMutex.Unlock()
 
-		return p.validProofSubmitter.RequestProof(ctx, event)
+		return nil
 	}
 
 	p.proposeConcurrencyGuard <- struct{}{}
@@ -719,6 +827,18 @@ func (p *Prover) onBlockProven(ctx context.Context, event *bindings.TaikoL1Clien
 		}
 	}
 
+	/*
+	// If the proven blockId is listed on unprovenBlocks,
+	// remove the proven block ID from the list of blocks to be proven
+	p.unprovenBlocksMutex.Lock()
+	for i, id := range p.unprovenBlocks {
+		if new(big.Int).SetUint64(*id).Cmp(event.BlockId) == 0 {
+			p.unprovenBlocks = append(p.unprovenBlocks[:i], p.unprovenBlocks[i+1:]...)
+			break
+		}
+	}
+	p.unprovenBlocksMutex.Unlock()
+	*/
 	return nil
 }
 
@@ -988,6 +1108,16 @@ func (p *Prover) requestProofForBlockId(blockId *big.Int, l1Height *big.Int) err
 			return nil
 		}
 
+		// Check if the block is already being proven
+		p.currentBlocksBeingProvenMutex.Lock()
+		_, isBeingProven := p.currentBlocksBeingProven[event.BlockId.Uint64()]
+		p.currentBlocksBeingProvenMutex.Unlock()
+
+		if isBeingProven {
+			//log.Info("Block is already being proven", "blockID", event.BlockId)
+			return nil
+		}
+
 		ctx, cancelCtx := context.WithCancel(ctx)
 		p.currentBlocksBeingProvenMutex.Lock()
 		p.currentBlocksBeingProven[event.BlockId.Uint64()] = cancelFunc(func() {
@@ -999,6 +1129,7 @@ func (p *Prover) requestProofForBlockId(blockId *big.Int, l1Height *big.Int) err
 		p.currentBlocksBeingProvenMutex.Unlock()
 
 		p.proposeConcurrencyGuard <- struct{}{}
+		log.Info("This block is provable", "blockID", blockId)
 
 		if err := p.validProofSubmitter.RequestProof(ctx, event); err != nil {
 			return err
