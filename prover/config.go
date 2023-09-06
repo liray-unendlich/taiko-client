@@ -44,6 +44,7 @@ type Config struct {
 	ProveBlockGasLimit              *uint64
 	ProofSubmissionDelay 			time.Duration
 	ProofStartTimeBeforeExpiry 		time.Duration
+	BackWardBlockNumber 			uint64
 }
 
 // NewConfigFromCliContext creates a new config instance from command line flags.
@@ -150,5 +151,6 @@ func NewConfigFromCliContext(c *cli.Context) (*Config, error) {
 		ProveBlockGasLimit:    proveBlockTxGasLimit,
 		ProofSubmissionDelay:  			time.Duration(c.Uint64(flags.ProofSubmissionDelay.Name)) * time.Second,
 		ProofStartTimeBeforeExpiry: 	time.Duration(c.Uint64(flags.ProofStartTimeBeforeExpiry.Name)) * time.Second,
+		BackWardBlockNumber:   c.Uint64(flags.BackWardBlockNumber.Name),
 	}, nil
 }

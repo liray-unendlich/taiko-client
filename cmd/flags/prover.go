@@ -117,6 +117,12 @@ var (
 		Category: proverCategory,
 		Value:    time.Second * 0,
 	}
+	BackWardBlockNumber = &cli.Uint64Flag{
+		Name:     "prover.backWardBlockNumber",
+		Usage:    "Start your prover behind the current block number by this amount",
+		Category: proverCategory,
+		Value:    1000,
+	}
 )
 
 // All prover flags.
@@ -142,4 +148,5 @@ var ProverFlags = MergeFlags(CommonFlags, []cli.Flag{
 	ProveBlockTxGasLimit,
 	ProofSubmissionDelay,
 	ProofStartTimeBeforeExpiry,
+	BackWardBlockNumber,
 })

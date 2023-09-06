@@ -83,6 +83,8 @@ type Prover struct {
 	currentBlocksBeingProvenMutex           *sync.Mutex
 	currentBlocksWaitingForProofWindow      map[uint64]uint64 // l2BlockId : l1Height
 	currentBlocksWaitingForProofWindowMutex *sync.Mutex
+	maxConcurrentProvingJobs uint
+	backWardBlockNumber uint64
 
 	// interval settings
 	checkProofWindowExpiredInterval time.Duration
@@ -155,8 +157,12 @@ func InitFromConfig(ctx context.Context, p *Prover, cfg *Config) (err error) {
 	// Concurrency guards
 	p.proposeConcurrencyGuard = make(chan struct{}, cfg.MaxConcurrentProvingJobs)
 	p.submitProofConcurrencyGuard = make(chan struct{}, cfg.MaxConcurrentProvingJobs)
+	p.maxConcurrentProvingJobs = cfg.MaxConcurrentProvingJobs
 
 	p.checkProofWindowExpiredInterval = p.cfg.CheckProofWindowExpiredInterval
+
+	// backward flag
+	p.backWardBlockNumber = cfg.BackWardBlockNumber
 
 	oracleProverAddress, err := p.rpc.TaikoL1.Resolve(nil, p.rpc.L1ChainID, rpc.StringToBytes32("oracle_prover"), true)
 	if err != nil {
@@ -234,7 +240,7 @@ func (p *Prover) Start() error {
 		return err
 	}
 	p.L1BlockHeightOnStartup = stateVars.NumBlocks
-	p.targetBlockId = p.L1BlockHeightOnStartup
+	p.targetBlockId = p.L1BlockHeightOnStartup - p.backWardBlockNumber
 	go p.eventLoop()
 
 	return nil
@@ -256,7 +262,6 @@ func (p *Prover) eventLoop() {
 	}
 
 	lastLatestVerifiedL1Height := p.latestVerifiedL1Height
-	currentTargetHeight := p.targetBlockId
 
 	// If there is too many (TaikoData.Config.maxNumBlocks) pending blocks in TaikoL1 contract, there will be no new
 	// BlockProposed temporarily, so except the BlockProposed subscription, we need another trigger to start
@@ -275,7 +280,6 @@ func (p *Prover) eventLoop() {
 
 	// Call reqProving() right away to catch up with the latest state.
 	reqProving()
-	loopCounter := 0
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -296,34 +300,22 @@ func (p *Prover) eventLoop() {
 			}()
 		case proofWithHeader := <-p.proofGenerationCh:
 			p.submitProofOp(p.ctx, proofWithHeader)
-			currentTargetHeight = currentTargetHeight + 1
 		case <-p.proveNotify:
-//			log.Info("Try proving new blocks:", "BlockID", currentTargetHeight)
-			if err := p.proveOp(p.ctx, new(big.Int).SetUint64(currentTargetHeight)); err != nil {
+//			log.Info("Try proving new blocks:", "BlockID", p.targetBlockId)
+			if err := p.proveOp(p.ctx, new(big.Int).SetUint64(p.targetBlockId)); err != nil {
 				log.Error("Prove new blocks error", "error", err)
-				currentTargetHeight = currentTargetHeight - 1
 			}
+			p.targetBlockId++
 		case <-p.blockProposedCh:
 			reqProving()
 		case e := <-p.blockVerifiedCh:
 			if err := p.onBlockVerified(p.ctx, e); err != nil {
 				log.Error("Handle BlockVerified event error", "error", err)
 			}
-			loopCounter++
-
-			if loopCounter % 1500 == 0 {
-				stateVars, err := p.rpc.GetProtocolStateVariables(nil)
-				if err != nil {
-					log.Error("Pull new Protocol state error", "error", err)
-				}
-				p.targetBlockId = stateVars.NumBlocks
-				currentTargetHeight = p.targetBlockId
-			}
 		case e := <-p.blockProvenCh:
 			if err := p.onBlockProven(p.ctx, e); err != nil {
 				log.Error("Handle BlockProven event error", "error", err)
 			}
-			currentTargetHeight = currentTargetHeight + 1
 		case e := <-p.proverSlashedCh:
 			if e.Addr.Hex() == p.proverAddress.Hex() {
 				log.Info("Prover slashed", "address", e.Addr.Hex(), "amount", e.Amount)
@@ -332,7 +324,6 @@ func (p *Prover) eventLoop() {
 			}
 		case <-forceProvingTicker.C:
 			reqProving()
-			currentTargetHeight = currentTargetHeight + 1
 		}
 	}
 }
@@ -401,7 +392,6 @@ func (p *Prover) proveOp(ctx context.Context, blockId *big.Int) error {
 	// If this block is already proven, we will pass this block
 	if isProven {
 		log.Info("Pass proven block", "blockID", blockId)
-		p.targetBlockId = blockId.Uint64() + 1
 		return nil
 	}
 
@@ -410,11 +400,12 @@ func (p *Prover) proveOp(ctx context.Context, blockId *big.Int) error {
 	if err != nil {
 		return err
 	}
+	proofWindowExpiresAt := block.ProposedAt + block.ProofWindow
+	proofWindowExpired := uint64(time.Now().Unix()) > proofWindowExpiresAt
 
 	// If this block is already assigned, we will put this block into waiting list to be proven later(after expired)
-	if (block.AssignedProver != p.proverAddress && block.AssignedProver != zeroAddress /*&& !proofWindowExpired*/) {
+	if (block.AssignedProver != p.proverAddress && block.AssignedProver != zeroAddress && !proofWindowExpired) {
 		log.Info("Pass unproveable block", "blockID", blockId)
-		p.targetBlockId = blockId.Uint64() + 1
         return nil
 	}
 
@@ -428,9 +419,8 @@ func (p *Prover) proveOp(ctx context.Context, blockId *big.Int) error {
 	gasLimit := l2Block.GasLimit()
 	// calculate gasUsed ratio from l2Block.GasUsed and l2Block.GasLimit
 	// if gasUsed ratio is less than 0.9, we will pass this block
-	if float64(gasUsed) / float64(gasLimit) < float64(0.9) {
+	if float64(gasUsed) / float64(gasLimit) < float64(0.4) {
 		log.Info("Pass block", "blockID", blockId, "gasRatio", float64(gasUsed) / float64(gasLimit))
-		p.targetBlockId = blockId.Uint64() + 1
 		return nil
 	}
 
@@ -572,7 +562,7 @@ func (p *Prover) onBlockProposed(
 
 		if isVerified {
 			log.Info("📋 Block has been verified", "blockID", event.BlockId)
-			p.targetBlockId = event.BlockId.Uint64() + 1
+			p.targetBlockId++
 			return nil
 		}
 
@@ -1131,6 +1121,11 @@ func (p *Prover) requestProofForBlockId(blockId *big.Int, l1Height *big.Int) err
 
 		if isBeingProven {
 			//log.Info("Block is already being proven", "blockID", event.BlockId)
+			return nil
+		}
+
+		// Check if the current proving concurrency limit has been reached
+		if len(p.currentBlocksBeingProven) >= int(p.maxConcurrentProvingJobs) {
 			return nil
 		}
 
